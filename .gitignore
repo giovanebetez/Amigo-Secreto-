@@ -1,0 +1,27 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+
+# local data & env
+/.data/
+.env
+.env*.local
+
+# vercel
+.vercel
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
+*.tsbuildinfo
+next-env.d.ts
+
+# arquivos locais preexistentes fora do projeto
+.placeholder
+Documento_Gamificacao_Konoha_Hardware.docx
