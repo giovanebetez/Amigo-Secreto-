@@ -26,6 +26,7 @@ export interface PublicGameStatus {
   participantNames: string[];
   storageConfigured: boolean;
   storageMode:
+    | "neon-postgres"
     | "vercel-blob"
     | "upstash-rest"
     | "redis-tcp"

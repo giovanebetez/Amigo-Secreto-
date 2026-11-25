@@ -10,6 +10,7 @@
     "test:game": "node scripts/test-e2e.mjs"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.2.1",
     "@vercel/blob": "^2.9.0",
     "canvas-confetti": "^1.9.3",
     "lucide-react": "^0.511.0",

@@ -13,9 +13,9 @@ Aplicação web feita em Next.js pronta para deploy na **Vercel**.
 
 Em ambiente local, o jogo salva automaticamente em `.data/amigo-secreto.json`.
 
-Em produção na Vercel, o app suporta automaticamente:
-- **Vercel Blob privado** (`BLOB_READ_WRITE_TOKEN` / `BLOB_STORE_ID`) com controle de concorrência otimista via ETag (`ifMatch`), ou
-- **Upstash Redis / Redis** (`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` ou `REDIS_URL`).
+Em produção na Vercel, o app usa **Neon Postgres** como banco principal (cria a tabela `amigo_secreto_state` automaticamente na primeira requisição):
+- **Neon Postgres (Recomendado)**: conecte em **Storage → Create Database → Neon** no painel do projeto na Vercel (injeta `DATABASE_URL` / `POSTGRES_URL` automaticamente).
+- Também suporta **Vercel Blob privado** (`BLOB_READ_WRITE_TOKEN` / `BLOB_STORE_ID`) e **Upstash Redis / Redis** (`UPSTASH_REDIS_REST_URL` / `REDIS_URL`).
 
 ## Variáveis opcionais
 

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import {
   BlobError,
   BlobPreconditionFailedError,
@@ -13,23 +14,37 @@ import type { GameState } from "./types";
 const STATE_KEY = "amigo_secreto:state:v1";
 const LOCK_KEY = "amigo_secreto:lock:v1";
 const BLOB_PATH = "amigo-secreto/state-v1.json";
+const NEON_ROW_ID = "default";
 const LOCAL_FILE_PATH = path.join(process.cwd(), ".data", "amigo-secreto.json");
 
 export class StorageNotConfiguredError extends Error {
   constructor() {
     super(
-      "Armazenamento na nuvem não configurado. Conecte um Vercel Blob ou banco Redis no painel do projeto na Vercel."
+      "Banco de dados não configurado. Conecte o Neon Postgres (Storage -> Neon) no painel do projeto na Vercel e faça um Redeploy."
     );
     this.name = "StorageNotConfiguredError";
   }
 }
 
 export type StorageMode =
+  | "neon-postgres"
   | "vercel-blob"
   | "upstash-rest"
   | "redis-tcp"
   | "local-file"
   | "unconfigured";
+
+function getNeonConnectionString(): string | null {
+  const url =
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRES_PRISMA_URL ||
+    process.env.NEON_DATABASE_URL ||
+    process.env.DATABASE_URL_UNPOOLED ||
+    process.env.POSTGRES_URL_NON_POOLING ||
+    "";
+  return url.trim() || null;
+}
 
 function getUpstashRestConfig(): { url: string; token: string } | null {
   const url =
@@ -49,6 +64,7 @@ function hasVercelBlobConfig(): boolean {
 }
 
 export function getStorageMode(): StorageMode {
+  if (getNeonConnectionString()) return "neon-postgres";
   if (getUpstashRestConfig()) return "upstash-rest";
   if (process.env.REDIS_URL) return "redis-tcp";
   if (hasVercelBlobConfig()) return "vercel-blob";
@@ -64,6 +80,98 @@ function createEmptyState(maxParticipants: number): GameState {
     assignments: {},
     drawnAt: null,
   };
+}
+
+// --- Neon Postgres (lazy initialization, build-time safe) ---
+const globalForDb = globalThis as unknown as {
+  __amigoSecretoNeonSql?: NeonQueryFunction<false, false>;
+  __amigoSecretoNeonSchemaPromise?: Promise<void>;
+  __amigoSecretoRedis?: RedisClientType;
+  __amigoSecretoLocalLock?: Promise<void>;
+};
+
+function getNeonSql(): NeonQueryFunction<false, false> {
+  const conn = getNeonConnectionString();
+  if (!conn) throw new StorageNotConfiguredError();
+  if (!globalForDb.__amigoSecretoNeonSql) {
+    globalForDb.__amigoSecretoNeonSql = neon(conn);
+  }
+  return globalForDb.__amigoSecretoNeonSql;
+}
+
+async function ensureNeonSchema(): Promise<void> {
+  if (!globalForDb.__amigoSecretoNeonSchemaPromise) {
+    const sql = getNeonSql();
+    globalForDb.__amigoSecretoNeonSchemaPromise = sql`
+      CREATE TABLE IF NOT EXISTS amigo_secreto_state (
+        id TEXT PRIMARY KEY,
+        state JSONB NOT NULL,
+        version BIGINT NOT NULL DEFAULT 1,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `
+      .then(() => undefined)
+      .catch((err) => {
+        globalForDb.__amigoSecretoNeonSchemaPromise = undefined;
+        throw err;
+      });
+  }
+  await globalForDb.__amigoSecretoNeonSchemaPromise;
+}
+
+async function readNeonStateWithVersion(
+  defaultMaxParticipants: number
+): Promise<{ state: GameState; version: number | null }> {
+  await ensureNeonSchema();
+  const sql = getNeonSql();
+  const rows = (await sql`
+    SELECT state, version
+    FROM amigo_secreto_state
+    WHERE id = ${NEON_ROW_ID}
+    LIMIT 1
+  `) as Array<{ state: GameState | string; version: string | number }>;
+
+  if (rows.length === 0) {
+    return { state: createEmptyState(defaultMaxParticipants), version: null };
+  }
+
+  const row = rows[0];
+  const parsedState =
+    typeof row.state === "string"
+      ? (JSON.parse(row.state) as GameState)
+      : row.state;
+
+  return {
+    state: parsedState,
+    version: Number(row.version),
+  };
+}
+
+async function writeNeonStateConditional(
+  state: GameState,
+  expectedVersion: number | null
+): Promise<boolean> {
+  await ensureNeonSchema();
+  const sql = getNeonSql();
+  const payload = JSON.stringify(state);
+
+  if (expectedVersion === null) {
+    const inserted = (await sql`
+      INSERT INTO amigo_secreto_state (id, state, version, updated_at)
+      VALUES (${NEON_ROW_ID}, ${payload}::jsonb, 1, NOW())
+      ON CONFLICT (id) DO NOTHING
+      RETURNING version
+    `) as Array<{ version: string | number }>;
+    return inserted.length > 0;
+  }
+
+  const updated = (await sql`
+    UPDATE amigo_secreto_state
+    SET state = ${payload}::jsonb, version = version + 1, updated_at = NOW()
+    WHERE id = ${NEON_ROW_ID} AND version = ${expectedVersion}
+    RETURNING version
+  `) as Array<{ version: string | number }>;
+  return updated.length > 0;
 }
 
 // --- Upstash / Vercel KV REST helpers ---
@@ -95,22 +203,17 @@ async function upstashCommand<T = unknown>(
   return data.result;
 }
 
-// --- Standard Redis TCP client (global singleton for serverless reuse) ---
-const globalForRedis = globalThis as unknown as {
-  __amigoSecretoRedis?: RedisClientType;
-  __amigoSecretoLocalLock?: Promise<void>;
-};
-
+// --- Standard Redis TCP client ---
 async function getRedisClient(): Promise<RedisClientType> {
   if (!process.env.REDIS_URL) throw new StorageNotConfiguredError();
-  if (!globalForRedis.__amigoSecretoRedis) {
+  if (!globalForDb.__amigoSecretoRedis) {
     const client = createClient({ url: process.env.REDIS_URL });
     client.on("error", (err) => {
       console.error("Redis client error:", err);
     });
-    globalForRedis.__amigoSecretoRedis = client as RedisClientType;
+    globalForDb.__amigoSecretoRedis = client as RedisClientType;
   }
-  const client = globalForRedis.__amigoSecretoRedis;
+  const client = globalForDb.__amigoSecretoRedis;
   if (!client.isOpen) {
     await client.connect();
   }
@@ -166,6 +269,11 @@ export async function readGameState(
 ): Promise<GameState> {
   const mode = getStorageMode();
 
+  if (mode === "neon-postgres") {
+    const { state } = await readNeonStateWithVersion(defaultMaxParticipants);
+    return state;
+  }
+
   if (mode === "upstash-rest") {
     const raw = await upstashCommand<string | null>(["GET", STATE_KEY]);
     if (!raw) return createEmptyState(defaultMaxParticipants);
@@ -199,7 +307,7 @@ export async function readGameState(
   throw new StorageNotConfiguredError();
 }
 
-async function writeNonBlobState(state: GameState): Promise<void> {
+async function writeNonCasState(state: GameState): Promise<void> {
   const mode = getStorageMode();
   const payload = JSON.stringify(state, null, 2);
 
@@ -231,6 +339,7 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Executa uma atualização atômica do estado do jogo:
+ * - No Neon Postgres: usa Compare-And-Swap por `version` com retry automático.
  * - No Vercel Blob: usa Compare-And-Swap via ETag (`ifMatch`) com retry automático.
  * - No Redis/Upstash: usa distributed lock (`SET NX PX`).
  * - Localmente: usa fila mutex in-process + rename atômico.
@@ -243,6 +352,26 @@ export async function updateGameStateAtomic<T>(
 
   if (mode === "unconfigured") {
     throw new StorageNotConfiguredError();
+  }
+
+  if (mode === "neon-postgres") {
+    const maxAttempts = 8;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const { state, version } = await readNeonStateWithVersion(
+        defaultMaxParticipants
+      );
+      const { nextState, result } = mutator(state);
+      const ok = await writeNeonStateConditional(nextState, version);
+      if (ok) {
+        return result;
+      }
+      if (attempt < maxAttempts - 1) {
+        await sleep(80 + crypto.randomInt(0, 100));
+      }
+    }
+    throw new Error(
+      "Muitas pessoas entrando ao mesmo tempo. Tente novamente em alguns segundos."
+    );
   }
 
   if (mode === "vercel-blob") {
@@ -273,17 +402,17 @@ export async function updateGameStateAtomic<T>(
   }
 
   if (mode === "local-file") {
-    const prev = globalForRedis.__amigoSecretoLocalLock ?? Promise.resolve();
+    const prev = globalForDb.__amigoSecretoLocalLock ?? Promise.resolve();
     let release!: () => void;
     const next = new Promise<void>((resolve) => {
       release = resolve;
     });
-    globalForRedis.__amigoSecretoLocalLock = prev.then(() => next);
+    globalForDb.__amigoSecretoLocalLock = prev.then(() => next);
     await prev;
     try {
       const state = await readGameState(defaultMaxParticipants);
       const { nextState, result } = mutator(state);
-      await writeNonBlobState(nextState);
+      await writeNonCasState(nextState);
       return result;
     } finally {
       release();
@@ -325,7 +454,7 @@ export async function updateGameStateAtomic<T>(
   try {
     const state = await readGameState(defaultMaxParticipants);
     const { nextState, result } = mutator(state);
-    await writeNonBlobState(nextState);
+    await writeNonCasState(nextState);
     return result;
   } finally {
     const releaseScript =

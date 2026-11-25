@@ -294,9 +294,10 @@ export function AmigoSecretoApp({
                 </p>
                 <p className="mt-1 text-amber-800">
                   Para que todas as {status.maxParticipants} pessoas compartilhem
-                  o mesmo sorteio, conecte uma integração{" "}
-                  <strong>Upstash Redis / Vercel KV</strong> no painel do
-                  projeto na Vercel e faça um novo deploy.
+                  o mesmo sorteio, conecte o banco{" "}
+                  <strong>Neon Postgres</strong> (aba{" "}
+                  <strong>Storage → Create Database → Neon</strong>) no painel
+                  do projeto na Vercel e faça um Redeploy.
                 </p>
               </div>
             </div>
